@@ -14,10 +14,9 @@ from telegram.ext import (
 
 from handlers.start   import start_handler, help_handler
 from handlers.category import category_handler, category_callback
-from handlers.recipe  import recipe_message_handler, random_handler, carousel_callback
+from handlers.recipe  import random_handler, carousel_callback
 from handlers.fridge  import (
-    fridge_handler, whatcook_handler, mode_handler,
-    favorites_handler, stats_handler, fridge_callback,
+    fridge_handler, favorites_handler, stats_handler, fridge_callback,
 )
 
 load_dotenv()
@@ -36,8 +35,6 @@ def build_app(token: str) -> Application:
     app.add_handler(CommandHandler("help",      help_handler))
     app.add_handler(CommandHandler("category",  category_handler))
     app.add_handler(CommandHandler("fridge",    fridge_handler))
-    app.add_handler(CommandHandler("whatcook",  whatcook_handler))
-    app.add_handler(CommandHandler("mode",      mode_handler))
     app.add_handler(CommandHandler("random",    random_handler))
     app.add_handler(CommandHandler("favorites", favorites_handler))
     app.add_handler(CommandHandler("stats",     stats_handler))
