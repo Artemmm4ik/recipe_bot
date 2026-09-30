@@ -1,5 +1,5 @@
 """
-Recipe Telegram Bot — финальная версия для render.com.
+Recipe Telegram Bot — финальная версия с Каруселью.
 """
 import os
 import asyncio
@@ -14,7 +14,7 @@ from telegram.ext import (
 
 from handlers.start   import start_handler, help_handler
 from handlers.category import category_handler, category_callback
-from handlers.recipe  import recipe_message_handler, random_handler
+from handlers.recipe  import recipe_message_handler, random_handler, carousel_callback
 from handlers.fridge  import (
     fridge_handler, whatcook_handler, mode_handler,
     favorites_handler, stats_handler, fridge_callback,
@@ -32,11 +32,9 @@ logger = logging.getLogger(__name__)
 def build_app(token: str) -> Application:
     app = Application.builder().token(token).build()
 
-    # Базовые
     app.add_handler(CommandHandler("start",     start_handler))
     app.add_handler(CommandHandler("help",      help_handler))
     app.add_handler(CommandHandler("category",  category_handler))
-    # Холодильник и режим
     app.add_handler(CommandHandler("fridge",    fridge_handler))
     app.add_handler(CommandHandler("whatcook",  whatcook_handler))
     app.add_handler(CommandHandler("mode",      mode_handler))
@@ -44,11 +42,13 @@ def build_app(token: str) -> Application:
     app.add_handler(CommandHandler("favorites", favorites_handler))
     app.add_handler(CommandHandler("stats",     stats_handler))
 
-    # Callback-кнопки
+    # Карусель рецептов
+    app.add_handler(CallbackQueryHandler(carousel_callback, pattern="^carousel_next"))
+    
+    # Категории и холодильник
     app.add_handler(CallbackQueryHandler(category_callback, pattern="^cat_"))
     app.add_handler(CallbackQueryHandler(fridge_callback,   pattern="^(fridge_|mode_|fav_)"))
 
-    # Текстовые сообщения (ингредиенты)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, recipe_message_handler))
 
     return app
