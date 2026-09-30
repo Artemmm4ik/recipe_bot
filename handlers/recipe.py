@@ -1,7 +1,13 @@
 """
-Главный хендлер рецептов — с процентами совпадения, строгим режимом,
-кнопками избранного и автосохранением холодильника.
+Главный хендлер рецептов.
+
+Ключевые оптимизации:
+1. Все переводы одного рецепта — параллельно (asyncio.gather)
+2. Фото с КОРОТКИМ caption (гарантированная доставка)
+3. Полный рецепт — отдельным текстовым сообщением
+4. Таймаут на весь перевод — не дольше 8 сек
 """
+import asyncio
 import logging
 import re
 
@@ -13,29 +19,25 @@ from telegram.error import TelegramError
 from config import CATEGORIES, TEXTS
 from utils.user_state import get_user_lang_code, set_user_lang, get_user_category, user_data
 from utils.translator import translate_ingredients
-from utils.translate_text import translate_to
+from utils.translate_text import translate_to, translate_many
 from utils.i18n import get_text
 from utils.fridge import (
-    get_mode, save_fridge, get_fridge, add_to_fridge, inc_stat, add_favorite
+    get_mode, add_to_fridge, get_fridge, inc_stat, add_favorite
 )
 from parsers.meal_api import (
     find_recipes, get_random_recipe,
-    extract_ingredients_from_meal, format_instructions
+    extract_ingredients_from_meal, format_instructions,
 )
 
 logger = logging.getLogger(__name__)
 
-CHOOSE_CAT_LABELS = ["выбрать категорию", "choose category"]
-
 
 def parse_ingredients(text: str) -> list[str]:
-    text = text.strip()
-    parts = re.split(r"[,;\n]+", text)
+    parts = re.split(r"[,;\n]+", text.strip())
     return [p.strip().lower() for p in parts if p.strip() and len(p.strip()) > 1]
 
 
-def match_label(pct: float, lang_code: str, texts: dict) -> str:
-    """Возвращает строку с оценкой совпадения."""
+def match_label(pct: float, texts: dict) -> str:
     if pct >= 99:
         return texts.get("match_100", "✅ 100%")
     if pct >= 80:
@@ -45,108 +47,171 @@ def match_label(pct: float, lang_code: str, texts: dict) -> str:
     return texts.get("match_low", "🔴 {pct}%").format(pct=int(pct))
 
 
-async def build_caption(
-    meal: dict,
-    lang_code: str,
-    user_ingredients_en: list[str],
-) -> str:
-    """Красивая подпись к фото рецепта на языке пользователя."""
+async def translate_ingredients_full(raw: list[str]) -> list[str]:
+    """Словарь → Google Translate для незнакомых. Параллельно."""
+    from_dict = translate_ingredients(raw)
+    untranslated_idx = [i for i, (o, t) in enumerate(zip(raw, from_dict)) if o == t]
+
+    if not untranslated_idx:
+        return from_dict
+
+    # Переводим непереведённые параллельно
+    words_to_tr = [raw[i] for i in untranslated_idx]
+    translated  = await translate_many(words_to_tr, "en")
+
+    result = list(from_dict)
+    for idx, tr in zip(untranslated_idx, translated):
+        result[idx] = tr
+    return result
+
+
+async def build_short_caption(meal: dict, lang_code: str, t: dict) -> str:
+    """
+    КОРОТКИЙ caption для фото — только название + % совпадения.
+    Переводится быстро (1 запрос), гарантированная доставка фото.
+    """
+    name_en = meal.get("strMeal", "Recipe")
+    match   = meal.get("_match", {})
+    pct     = match.get("percent", 0)
+
+    is_en = lang_code.startswith("en")
+    name  = name_en if is_en else await translate_to(name_en, lang_code)
+
+    match_str = match_label(pct, t)
+    cat = meal.get("strCategory", "")
+
+    caption = f"🍽 <b>{name}</b>"
+    if cat:
+        caption += f"\n🏷 {cat}"
+    caption += f"\n{match_str}"
+    return caption[:900]
+
+
+async def build_full_text(meal: dict, lang_code: str, user_ings_en: list[str], t: dict) -> str:
+    """
+    Полный рецепт как отдельное текстовое сообщение.
+    Все переводы — параллельно.
+    """
     name_en   = meal.get("strMeal", "Recipe")
-    area      = meal.get("strArea", "")
-    category  = meal.get("strCategory", "")
     youtube   = meal.get("strYoutube", "")
     source    = meal.get("strSource", "")
     instr_raw = meal.get("strInstructions", "") or ""
     match     = meal.get("_match", {})
 
+    matched  = match.get("matched",  [])[:8]
+    missing  = match.get("missing",  [])[:5]
+    staples  = match.get("staples",  [])[:4]
+
     is_en = lang_code.startswith("en")
+    instr_short = format_instructions(instr_raw, max_chars=600)
 
-    # Переводим название, категорию, область
-    name    = name_en if is_en else await translate_to(name_en, lang_code)
-    cat_tr  = category if is_en else await translate_to(category, lang_code)
-    area_tr = area     if is_en else await translate_to(area,     lang_code)
-
-    # Ингредиенты
-    matched  = match.get("matched",  [])
-    missing  = match.get("missing",  [])
-    staples  = match.get("staples",  [])
-    pct      = match.get("percent",  0)
-
-    if not is_en:
-        matched_tr = [await translate_to(i, lang_code) for i in matched[:8]]
-        missing_tr = [await translate_to(i, lang_code) for i in missing[:5]]
+    if is_en:
+        # Нет переводов — мгновенно
+        matched_tr = matched
+        missing_tr = missing
+        instr_tr   = instr_short
+        lbl_from   = t.get("lbl_from_your",   "From your ingredients")
+        lbl_buy    = t.get("lbl_buy_more",    "You'll also need")
+        lbl_cook   = t.get("lbl_cooking",     "Instructions")
+        lbl_yt     = t.get("lbl_youtube",     "Video on YouTube")
+        lbl_recipe = t.get("lbl_full_recipe", "Full recipe")
+        lbl_staple = t.get("lbl_staples",     "Basic staples")
     else:
-        matched_tr = matched[:8]
-        missing_tr = missing[:5]
+        # Все переводы ПАРАЛЛЕЛЬНО
+        to_translate = (
+            [name_en] +
+            matched +
+            missing +
+            [instr_short] +
+            [t.get("lbl_from_your","From your ingredients"),
+             t.get("lbl_buy_more","You'll also need"),
+             t.get("lbl_cooking","Instructions"),
+             t.get("lbl_youtube","Video on YouTube"),
+             t.get("lbl_full_recipe","Full recipe"),
+             t.get("lbl_staples","Basic staples")]
+        )
+        results = await translate_many(to_translate, lang_code)
 
-    # Инструкция
-    instr_short = format_instructions(instr_raw, max_chars=400)
-    if instr_short and not is_en:
-        instr_tr = await translate_to(instr_short, lang_code)
-    else:
-        instr_tr = instr_short
+        idx = 0
+        # name_tr = results[idx]; idx += 1   # уже переведено в short caption
+        idx += 1
+        matched_tr = results[idx:idx+len(matched)]; idx += len(matched)
+        missing_tr = results[idx:idx+len(missing)]; idx += len(missing)
+        instr_tr   = results[idx]; idx += 1
+        lbl_from, lbl_buy, lbl_cook, lbl_yt, lbl_recipe, lbl_staple = results[idx:idx+6]
 
-    # Метки
-    lbl_from   = await get_text("lbl_from_your",   lang_code)
-    lbl_buy    = await get_text("lbl_buy_more",    lang_code)
-    lbl_cook   = await get_text("lbl_cooking",     lang_code)
-    lbl_yt     = await get_text("lbl_youtube",     lang_code)
-    lbl_recipe = await get_text("lbl_full_recipe", lang_code)
-
-    # Оценка совпадения
-    ui_lang = "ru" if lang_code in ("ru", "uk") else "en"
-    t = TEXTS[ui_lang]
-    match_str = match_label(pct, lang_code, t)
-
-    # Собираем подпись
-    caption = f"🍽 <b>{name}</b>"
-    if cat_tr or area_tr:
-        caption += f"\n🏷 {cat_tr}" + (f" · {area_tr}" if area_tr else "")
-    caption += f"\n{match_str}\n\n"
-
+    # Собираем текст
+    lines = []
     if matched_tr:
-        caption += f"✅ <b>{lbl_from}:</b>\n"
-        caption += "\n".join(f"• {i}" for i in matched_tr) + "\n"
-
+        lines.append(f"✅ <b>{lbl_from}:</b>")
+        lines += [f"• {i}" for i in matched_tr]
     if missing_tr:
-        caption += f"\n➕ <b>{lbl_buy}:</b>\n"
-        caption += "\n".join(f"• {i}" for i in missing_tr) + "\n"
-
+        lines.append(f"\n➕ <b>{lbl_buy}:</b>")
+        lines += [f"• {i}" for i in missing_tr]
+    if staples:
+        lines.append(f"\n🧂 <b>{lbl_staple}:</b>")
+        lines.append(", ".join(staples[:4]))
     if instr_tr:
-        caption += f"\n👨‍🍳 <b>{lbl_cook}:</b>\n{instr_tr}"
-
+        lines.append(f"\n👨‍🍳 <b>{lbl_cook}:</b>")
+        lines.append(instr_tr)
     if youtube:
-        caption += f"\n\n▶️ <a href='{youtube}'>{lbl_yt}</a>"
+        lines.append(f"\n▶️ <a href='{youtube}'>{lbl_yt}</a>")
     elif source:
-        caption += f"\n\n🔗 <a href='{source}'>{lbl_recipe}</a>"
+        lines.append(f"\n🔗 <a href='{source}'>{lbl_recipe}</a>")
 
-    return caption[:1020] + ("..." if len(caption) > 1020 else "")
-
-
-def make_recipe_keyboard(meal: dict, user_id: int, lang_code: str) -> InlineKeyboardMarkup:
-    """Инлайн-кнопки под рецептом: ❤️ В избранное."""
-    meal_id  = meal.get("idMeal", "")
-    name     = meal.get("strMeal", "")[:50]
-    source   = meal.get("strSource", "") or meal.get("strYoutube", "")
-    fav_data = f"fav_add_{meal_id}|{name}|{source}"
-
-    row = [InlineKeyboardButton("❤️", callback_data=fav_data)]
-    return InlineKeyboardMarkup([row])
+    text = "\n".join(lines)
+    return text[:4000]
 
 
-async def translate_ingredients_full(raw: list[str]) -> list[str]:
+def make_keyboard(meal: dict) -> InlineKeyboardMarkup:
+    meal_id = meal.get("idMeal", "")
+    name    = meal.get("strMeal", "")[:40]
+    source  = meal.get("strSource", "") or meal.get("strYoutube", "")
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("❤️", callback_data=f"fav_add_{meal_id}|{name}|{source}")
+    ]])
+
+
+async def send_recipe(update: Update, meal: dict, lang_code: str,
+                      user_ings_en: list[str], t: dict) -> None:
     """
-    Переводит ингредиенты в EN: сначала словарь, потом Google для незнакомых.
+    Отправляем рецепт:
+    1. Фото с КОРОТКИМ caption (гарантированная доставка)
+    2. Полный рецепт — следующим сообщением
     """
-    from_dict = translate_ingredients(raw)
-    result = []
-    for orig, via_dict in zip(raw, from_dict):
-        if orig == via_dict:   # словарь не нашёл — переводим через API
-            en = await translate_to(orig, "en")
-            result.append(en)
-        else:
-            result.append(via_dict)
-    return result
+    photo_url = meal.get("strMealThumb", "")
+    keyboard  = make_keyboard(meal)
+
+    # Короткий caption — переводим только название (1 запрос)
+    short_cap = await build_short_caption(meal, lang_code, t)
+
+    # Отправляем фото
+    sent_photo = False
+    if photo_url:
+        try:
+            await update.message.reply_photo(
+                photo=photo_url,
+                caption=short_cap,
+                parse_mode="HTML",
+            )
+            sent_photo = True
+        except TelegramError as e:
+            logger.warning(f"reply_photo failed: {e}")
+
+    if not sent_photo:
+        # Фото не отправилось — шлём текст с названием
+        try:
+            await update.message.reply_html(short_cap)
+        except Exception:
+            pass
+
+    # Полный рецепт — отдельным сообщением (переводим всё параллельно)
+    try:
+        full_text = await build_full_text(meal, lang_code, user_ings_en, t)
+        if full_text:
+            await update.message.reply_html(full_text, reply_markup=keyboard)
+    except Exception as e:
+        logger.error(f"build_full_text error: {e}")
 
 
 async def recipe_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -158,40 +223,40 @@ async def recipe_message_handler(update: Update, context: ContextTypes.DEFAULT_T
     if user_id not in user_data or "lang_code" not in user_data.get(user_id, {}):
         set_user_lang(user_id, (user.language_code or "ru").strip())
     lang_code = get_user_lang_code(user_id)
+    ui_lang   = "ru" if lang_code in ("ru", "uk") else "en"
+    t         = TEXTS[ui_lang]
 
-    # Кнопка категории
-    btn_cat = (await get_text("btn_category", lang_code)).lower()
-    if btn_cat in text.lower() or "/category" in text.lower():
+    # Кнопка "Выбрать категорию"
+    btn_cat = t.get("btn_category", "").lower()
+    if btn_cat and btn_cat in text.lower():
         from handlers.category import category_handler
         await category_handler(update, context)
         return
 
     ingredients_raw = parse_ingredients(text)
     if not ingredients_raw:
-        await update.message.reply_html(await get_text("too_short", lang_code))
+        await update.message.reply_html(t["too_short"])
         return
 
-    # Автосохранение в холодильник
+    # Автосохранение холодильника
     add_to_fridge(user_id, ingredients_raw)
 
-    # Переводим в EN для API
+    # Перевод ингредиентов → EN (параллельно)
     ingredients_en = await translate_ingredients_full(ingredients_raw)
 
     cat_key  = get_user_category(user_id)
     cat_data = CATEGORIES.get(cat_key, CATEGORIES["any"])
-    ui_lang  = "ru" if lang_code in ("ru", "uk") else "en"
     cat_label = cat_data[ui_lang]
-    if lang_code not in ("ru", "uk") and not lang_code.startswith("en"):
-        cat_label = await translate_to(cat_data["en"], lang_code)
+    mode      = get_mode(user_id)
 
-    mode = get_mode(user_id)
-
+    # Статус
     await update.message.chat.send_action(ChatAction.TYPING)
-    ing_display  = ", ".join(ingredients_raw[:6])
-    status_msg   = await update.message.reply_html(
-        (await get_text("searching", lang_code)).format(ingredients=ing_display)
+    ing_display = ", ".join(ingredients_raw[:6])
+    status_msg  = await update.message.reply_html(
+        t["searching"].format(ingredients=ing_display)
     )
 
+    # Поиск
     try:
         meals = await find_recipes(
             ingredients_en=ingredients_en,
@@ -200,16 +265,15 @@ async def recipe_message_handler(update: Update, context: ContextTypes.DEFAULT_T
             max_results=3,
         )
     except Exception as e:
-        logger.error(f"Ошибка API: {e}")
-        await status_msg.edit_text(await get_text("error", lang_code), parse_mode="HTML")
+        logger.error(f"find_recipes error: {e}")
+        await status_msg.edit_text(t["error"], parse_mode="HTML")
         return
 
-    # Статистика
     inc_stat(user_id, "searches")
     inc_stat(user_id, "recipes_seen", len(meals) if meals else 0)
 
     if not meals:
-        await status_msg.edit_text(await get_text("no_results", lang_code), parse_mode="HTML")
+        await status_msg.edit_text(t["no_results"], parse_mode="HTML")
         return
 
     try:
@@ -221,63 +285,47 @@ async def recipe_message_handler(update: Update, context: ContextTypes.DEFAULT_T
     if mode == "strict":
         best_pct = meals[0].get("_match", {}).get("percent", 0)
         if best_pct < 80:
-            warn = await get_text("strict_warn", lang_code)
-            await update.message.reply_html(warn)
+            await update.message.reply_html(t.get("strict_warn", ""))
 
     # Заголовок
     mode_icon = "🎯" if mode == "strict" else "🔍"
     header = (
         f"📂 <b>{cat_label}</b>  {mode_icon}\n"
         f"<i>{ing_display}</i>\n"
-        f"{(await get_text('results_header', lang_code)).format(count=len(meals))}"
+        f"{t['results_header'].format(count=len(meals))}"
     )
     await update.message.reply_html(header)
 
     # Отправляем рецепты
-    await update.message.chat.send_action(ChatAction.UPLOAD_PHOTO)
     for meal in meals:
-        photo_url = meal.get("strMealThumb", "")
-        caption   = await build_caption(meal, lang_code, ingredients_en)
-        keyboard  = make_recipe_keyboard(meal, user_id, lang_code)
-
-        try:
-            if photo_url:
-                await update.message.reply_photo(
-                    photo=photo_url, caption=caption,
-                    parse_mode="HTML", reply_markup=keyboard,
-                )
-            else:
-                await update.message.reply_html(caption, reply_markup=keyboard)
-        except TelegramError as e:
-            logger.error(f"Ошибка отправки фото: {e}")
-            try:
-                await update.message.reply_html(caption, reply_markup=keyboard)
-            except Exception:
-                pass
+        await update.message.chat.send_action(ChatAction.UPLOAD_PHOTO)
+        await send_recipe(update, meal, lang_code, ingredients_en, t)
 
 
-# ── /random — случайный рецепт ────────────────────────────────
+# ── /random ───────────────────────────────────────────────────
 async def random_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id   = update.effective_user.id
     lang_code = get_user_lang_code(user_id)
+    ui_lang   = "ru" if lang_code in ("ru", "uk") else "en"
+    t         = TEXTS[ui_lang]
 
     fridge = get_fridge(user_id)
     ing_en = await translate_ingredients_full(fridge) if fridge else ["chicken", "pasta", "rice"]
 
     await update.message.chat.send_action(ChatAction.TYPING)
     status = await update.message.reply_html(
-        "🎲 " + (await get_text("searching", lang_code)).format(ingredients="...")
+        "🎲 " + t["searching"].format(ingredients="...")
     )
 
     try:
         meal = await get_random_recipe(ing_en)
     except Exception as e:
-        logger.error(f"Random error: {e}")
-        await status.edit_text(await get_text("error", lang_code), parse_mode="HTML")
+        logger.error(f"random error: {e}")
+        await status.edit_text(t["error"], parse_mode="HTML")
         return
 
     if not meal:
-        await status.edit_text(await get_text("no_results", lang_code), parse_mode="HTML")
+        await status.edit_text(t["no_results"], parse_mode="HTML")
         return
 
     try:
@@ -285,20 +333,6 @@ async def random_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     except TelegramError:
         pass
 
-    title = await get_text("random_title", lang_code)
-    await update.message.reply_html(title)
-
-    caption  = await build_caption(meal, lang_code, ing_en)
-    keyboard = make_recipe_keyboard(meal, user_id, lang_code)
-    photo    = meal.get("strMealThumb", "")
-
-    try:
-        if photo:
-            await update.message.reply_photo(
-                photo=photo, caption=caption,
-                parse_mode="HTML", reply_markup=keyboard,
-            )
-        else:
-            await update.message.reply_html(caption, reply_markup=keyboard)
-    except TelegramError:
-        await update.message.reply_html(caption, reply_markup=keyboard)
+    await update.message.reply_html(t.get("random_title", "🎲 <b>Рецепт-сюрприз:</b>"))
+    await update.message.chat.send_action(ChatAction.UPLOAD_PHOTO)
+    await send_recipe(update, meal, lang_code, ing_en, t)
