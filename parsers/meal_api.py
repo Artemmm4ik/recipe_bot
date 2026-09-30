@@ -1,7 +1,5 @@
 """
-Оптимизированный API-клиент, который при нехватке точных результатов
-перемешивает исходные ингредиенты и ищет по ним, чтобы избежать
-одинаковой выдачи (одного и того же пирога).
+Оптимизированный API-клиент с правильным расчетом процентов.
 """
 import asyncio
 import logging
@@ -66,7 +64,13 @@ def extract_ingredients_from_meal(meal: dict) -> list[str]:
         if name: ingredients.append(f"{measure} {name}".strip() if measure else name)
     return ingredients
 
+
 def calculate_match(meal: dict, user_ingredients_en: list[str]) -> dict:
+    """
+    Рассчитывает совпадение. 
+    Важно: процент считается ТОЛЬКО по 'не-базовым' ингредиентам.
+    Базовые (соль, масло и т.д.) исключаются из формулы, чтобы не завышать %.
+    """
     recipe_ings = extract_ingredients_from_meal(meal)
     user_set = set(u.lower().strip() for u in user_ingredients_en)
 
@@ -80,10 +84,22 @@ def calculate_match(meal: dict, user_ingredients_en: list[str]) -> dict:
         else:
             missing.append(ing)
 
-    total = len(recipe_ings)
-    covered = len(matched) + len(staples)
-    percent = (covered / total * 100) if total > 0 else 0
-    return {"percent": round(percent, 1), "matched": matched, "missing": missing, "staples": staples, "total": total}
+    # Процент считается только по НЕ базовым продуктам!
+    important_total = len(matched) + len(missing)
+    if important_total > 0:
+        percent = (len(matched) / important_total) * 100
+    else:
+        # Если рецепт состоит ТОЛЬКО из базовых продуктов (например, яичница с солью)
+        percent = 100.0 if len(matched) > 0 or len(staples) > 0 else 0.0
+
+    return {
+        "percent": round(percent, 1), 
+        "matched": matched, 
+        "missing": missing, 
+        "staples": staples, 
+        "total": len(recipe_ings)
+    }
+
 
 def format_instructions(text: str, max_chars: int = 400) -> str:
     if not text: return ""
@@ -169,8 +185,8 @@ async def find_recipes(ingredients_en: list[str], category_key: str = "any", mod
         final_meals.extend(group)
 
     if mode == "strict":
-        # В строгом режиме допускаем максимум 1-2 недостающих ингредиента
-        filtered = [m for m in final_meals if len(m["_match"]["missing"]) <= 2 and m["_match"]["percent"] >= 70]
+        # В строгом режиме допускаем максимум 1 недостающий ингредиент
+        filtered = [m for m in final_meals if len(m["_match"]["missing"]) <= 1 and m["_match"]["percent"] >= 50]
         if not filtered:
             filtered = final_meals
     else:

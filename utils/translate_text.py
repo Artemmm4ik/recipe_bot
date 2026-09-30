@@ -1,10 +1,9 @@
 """
-Переводчик: последовательный перевод с микрозадержкой,
-так как батчинг через разделители ломается на стороне Google.
+Переводчик с многоуровневым Fallback'ом, 
+так как Google Translate банит IP на бесплатных серверах.
 """
 import asyncio
 import logging
-from functools import lru_cache
 
 from langdetect import detect, DetectorFactory
 from langdetect.lang_detect_exception import LangDetectException
@@ -32,25 +31,37 @@ def _translate_sync(text: str, target: str) -> str:
         return _cache[key]
 
     try:
-        import time
-        from deep_translator import GoogleTranslator
-
         if _detect_lang(text) == target:
             _cache[key] = text
             return text
+            
+        import time
+        from deep_translator import GoogleTranslator, MyMemoryTranslator
 
-        for attempt in range(3):
+        # 1. Пробуем Google
+        for attempt in range(2):
             try:
-                result = GoogleTranslator(source="auto", target=target).translate(text)
-                if result:
-                    _cache[key] = result
-                    return result
+                res = GoogleTranslator(source="auto", target=target).translate(text)
+                if res:
+                    _cache[key] = res
+                    return res
             except Exception as e:
                 err = str(e).lower()
                 if "too many requests" in err or "rate" in err:
-                    time.sleep(1.0 * (attempt + 1))
+                    time.sleep(0.5)
                 else:
                     break
+
+        # 2. Если Google забанил IP, пробуем MyMemory (формат ru-RU)
+        target_mymemory = "ru-RU" if target == "ru" else f"{target}-{target.upper()}"
+        source_mymemory = "en-GB"
+        try:
+            res = MyMemoryTranslator(source=source_mymemory, target=target_mymemory).translate(text)
+            if res:
+                _cache[key] = res
+                return res
+        except Exception as e:
+            logger.warning(f"MyMemory fallback error: {e}")
 
     except Exception as e:
         logger.warning(f"Ошибка перевода (→{target}): {e}")
@@ -75,28 +86,16 @@ async def translate_to(text: str, lang_code: str) -> str:
 
 
 async def translate_many(texts: list[str], lang_code: str) -> list[str]:
-    """
-    Чтобы не ловить 'Too many requests' от параллельного спама, 
-    и не ломать Google разделителями (батчинг глючит), 
-    переводим строго по одному с микрозадержкой. 
-    (5 коротких строк займут 1-2 секунды, это нормально)
-    """
-    if not texts:
-        return []
+    """Переводит по одному с fallback API."""
+    if not texts: return []
 
     results = []
     for text in texts:
         if not text:
             results.append("")
             continue
-            
-        key = (hash(text), lang_code)
-        if key in _cache:
-            results.append(_cache[key])
-            continue
-            
         res = await translate_to(text, lang_code)
         results.append(res)
-        await asyncio.sleep(0.1) # Защита от rate-limit
+        await asyncio.sleep(0.05)
         
     return results
