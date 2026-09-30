@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: recipe-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    # render.com сам задаёт PORT — не переопределяем его здесь!
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false          # вводишь вручную в дашборде render.com
+      - key: WEBHOOK_URL
+        sync: false          # вводишь вручную: https://<твой-app>.onrender.com
+    healthCheckPath: /health  # render.com пингует этот путь
+    autoDeploy: true
