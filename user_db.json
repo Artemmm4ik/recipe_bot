@@ -1,0 +1,28 @@
+{
+  "12345": {
+    "fridge": [
+      "яйца",
+      "сыр",
+      "помидоры",
+      "огурец",
+      "лук"
+    ],
+    "favorites": [
+      {
+        "id": "meal_1",
+        "name": "Борщ",
+        "url": "https://a.com",
+        "saved": "2026-09-30T20:39:53.221681"
+      }
+    ],
+    "mode": "normal",
+    "stats": {
+      "searches": 5,
+      "recipes_seen": 0,
+      "favorites_count": 1
+    },
+    "liked": [],
+    "disliked": [],
+    "joined": "2026-09-30T20:39:53.221144"
+  }
+}

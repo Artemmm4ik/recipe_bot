@@ -1,10 +1,5 @@
 """
-Recipe Telegram Bot — оптимизирован для render.com.
-
-Render.com требует:
-1. Слушать на PORT из переменной окружения
-2. Отвечать на HTTP health-check (GET /health)
-3. Работать через webhook (не polling)
+Recipe Telegram Bot — финальная версия для render.com.
 """
 import os
 import asyncio
@@ -13,16 +8,17 @@ from aiohttp import web
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    filters,
+    Application, CommandHandler, MessageHandler,
+    CallbackQueryHandler, filters,
 )
 
-from handlers.start import start_handler, help_handler
+from handlers.start   import start_handler, help_handler
 from handlers.category import category_handler, category_callback
-from handlers.recipe import recipe_message_handler
+from handlers.recipe  import recipe_message_handler, random_handler
+from handlers.fridge  import (
+    fridge_handler, whatcook_handler, mode_handler,
+    favorites_handler, stats_handler, fridge_callback,
+)
 
 load_dotenv()
 
@@ -34,100 +30,89 @@ logger = logging.getLogger(__name__)
 
 
 def build_app(token: str) -> Application:
-    """Строим Telegram Application и регистрируем хендлеры."""
     app = Application.builder().token(token).build()
-    app.add_handler(CommandHandler("start", start_handler))
-    app.add_handler(CommandHandler("help", help_handler))
-    app.add_handler(CommandHandler("category", category_handler))
+
+    # Базовые
+    app.add_handler(CommandHandler("start",     start_handler))
+    app.add_handler(CommandHandler("help",      help_handler))
+    app.add_handler(CommandHandler("category",  category_handler))
+    # Холодильник и режим
+    app.add_handler(CommandHandler("fridge",    fridge_handler))
+    app.add_handler(CommandHandler("whatcook",  whatcook_handler))
+    app.add_handler(CommandHandler("mode",      mode_handler))
+    app.add_handler(CommandHandler("random",    random_handler))
+    app.add_handler(CommandHandler("favorites", favorites_handler))
+    app.add_handler(CommandHandler("stats",     stats_handler))
+
+    # Callback-кнопки
     app.add_handler(CallbackQueryHandler(category_callback, pattern="^cat_"))
+    app.add_handler(CallbackQueryHandler(fridge_callback,   pattern="^(fridge_|mode_|fav_)"))
+
+    # Текстовые сообщения (ингредиенты)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, recipe_message_handler))
+
     return app
 
 
-# ─── WEBHOOK режим (render.com) ───────────────────────────────
 async def run_webhook(token: str, webhook_url: str, port: int) -> None:
-    """Запуск через webhook — для render.com."""
     tg_app = build_app(token)
-
     webhook_path = f"/webhook/{token}"
-    full_webhook_url = f"{webhook_url.rstrip('/')}{webhook_path}"
+    full_url = f"{webhook_url.rstrip('/')}{webhook_path}"
 
-    logger.info(f"Инициализация бота...")
     await tg_app.initialize()
     await tg_app.start()
-
-    logger.info(f"Регистрируем webhook: {full_webhook_url}")
     await tg_app.bot.set_webhook(
-        url=full_webhook_url,
+        url=full_url,
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
     )
+    logger.info(f"Webhook: {full_url}")
 
-    # aiohttp: принимает webhook от Telegram + отвечает на health-check
-    async def telegram_webhook(request: web.Request) -> web.Response:
+    async def tg_webhook(request: web.Request) -> web.Response:
         try:
-            data = await request.json()
-            update = Update.de_json(data, tg_app.bot)
+            update = Update.de_json(await request.json(), tg_app.bot)
             await tg_app.process_update(update)
         except Exception as e:
-            logger.error(f"Ошибка обработки update: {e}")
+            logger.error(f"Update error: {e}")
         return web.Response(status=200)
 
-    async def health_check(request: web.Request) -> web.Response:
+    async def health(_: web.Request) -> web.Response:
         return web.Response(text="OK", status=200)
 
     web_app = web.Application()
-    web_app.router.add_get("/", health_check)
-    web_app.router.add_get("/health", health_check)
-    web_app.router.add_post(webhook_path, telegram_webhook)
+    web_app.router.add_get("/",       health)
+    web_app.router.add_get("/health", health)
+    web_app.router.add_post(webhook_path, tg_webhook)
 
     runner = web.AppRunner(web_app)
     await runner.setup()
-    site = web.TCPSite(runner, host="0.0.0.0", port=port)
-    await site.start()
-
-    logger.info(f"✅ Сервер слушает порт {port}")
-    logger.info(f"✅ Webhook: {full_webhook_url}")
+    await web.TCPSite(runner, "0.0.0.0", port).start()
+    logger.info(f"Server on port {port}")
 
     try:
-        await asyncio.Event().wait()  # держим процесс живым
+        await asyncio.Event().wait()
     finally:
-        logger.info("Завершаем работу...")
         await tg_app.stop()
         await tg_app.shutdown()
         await runner.cleanup()
 
 
-# ─── POLLING режим (локальная разработка) ─────────────────────
 def run_polling(token: str) -> None:
-    """
-    Polling — только для локальной разработки.
-    ВАЖНО: вызывается синхронно — НЕ через asyncio.run(),
-    чтобы python-telegram-bot управлял event loop сам.
-    """
-    logger.info("🔧 Режим polling (локальная разработка)...")
-    app = build_app(token)
-    # run_polling() сам создаёт и управляет event loop
-    app.run_polling(drop_pending_updates=True)
+    logger.info("Polling mode (development)...")
+    build_app(token).run_polling(drop_pending_updates=True)
 
 
-# ─── ТОЧКА ВХОДА ──────────────────────────────────────────────
 def main() -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
-        raise ValueError(
-            "❌ TELEGRAM_BOT_TOKEN не задан!\n"
-            "Добавь его в Environment Variables на render.com"
-        )
+        raise ValueError("TELEGRAM_BOT_TOKEN не задан!")
 
     webhook_url = os.getenv("WEBHOOK_URL", "").strip()
-    port = int(os.getenv("PORT", 10000))
+    port        = int(os.getenv("PORT", 10000))
 
     if webhook_url:
-        # render.com: webhook режим через asyncio.run
         asyncio.run(run_webhook(token, webhook_url, port))
     else:
-        # Локально: polling — синхронный вызов, без asyncio.run()
         run_polling(token)
 
 

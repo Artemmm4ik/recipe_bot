@@ -1,33 +1,36 @@
 """
-Обработчик команды /start и /help.
+Обработчик /start и /help — с поддержкой любого языка Telegram.
 """
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import ContextTypes
 
-from config import TEXTS
-from utils.user_state import get_user_lang, set_user_lang
+from utils.user_state import set_user_lang, get_user_lang_code
+from utils.i18n import get_text
 
 
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     user_id = user.id
 
-    # Определяем язык по Telegram language_code
-    tg_lang = user.language_code or "ru"
-    lang = "ru" if tg_lang.startswith("ru") else "en"
-    set_user_lang(user_id, lang)
+    # Читаем язык Telegram-приложения пользователя
+    tg_lang = (user.language_code or "ru").strip()
+    set_user_lang(user_id, tg_lang)
+    lang_code = get_user_lang_code(user_id)
 
-    t = TEXTS[lang]
+    welcome = await get_text("welcome", lang_code)
+
+    # Кнопка "Выбрать категорию" — переводим
+    btn_label = await get_text("btn_category", lang_code)
     keyboard = ReplyKeyboardMarkup(
-        [[KeyboardButton("📂 Выбрать категорию" if lang == "ru" else "📂 Choose Category")]],
+        [[KeyboardButton(btn_label)]],
         resize_keyboard=True,
         one_time_keyboard=False,
     )
-    await update.message.reply_html(t["welcome"], reply_markup=keyboard)
+    await update.message.reply_html(welcome, reply_markup=keyboard)
 
 
 async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
-    lang = get_user_lang(user_id)
-    t = TEXTS[lang]
-    await update.message.reply_html(t["help"])
+    lang_code = get_user_lang_code(user_id)
+    help_text = await get_text("help", lang_code)
+    await update.message.reply_html(help_text)

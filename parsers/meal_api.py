@@ -1,6 +1,5 @@
 """
-Клиент для TheMealDB API — бесплатный, без ключей, ищет по ингредиентам.
-https://www.themealdb.com/api.php
+Клиент для TheMealDB API — поиск по ингредиентам с расчётом совпадения.
 """
 import asyncio
 import logging
@@ -10,16 +9,15 @@ from typing import Optional
 import aiohttp
 import certifi
 
+from utils.pantry import is_staple, filter_non_staples
+
 logger = logging.getLogger(__name__)
 
 BASE = "https://www.themealdb.com/api/json/v1/1"
 TIMEOUT = aiohttp.ClientTimeout(total=15, connect=8)
-HEADERS = {"User-Agent": "RecipeBot/1.0"}
-
-# SSL контекст — работает и на Mac, и на render.com (Linux)
+HEADERS = {"User-Agent": "RecipeBot/2.0"}
 SSL_CTX = ssl.create_default_context(cafile=certifi.where())
 
-# TheMealDB категории для наших типов
 CATEGORY_MAP = {
     "any":     None,
     "diet":    "Vegetarian",
@@ -27,7 +25,7 @@ CATEGORY_MAP = {
     "dessert": "Dessert",
     "vegan":   "Vegan",
     "quick":   None,
-    "soup":    "Soup",   # TheMealDB не имеет категории Soup — будем искать по ключевому слову
+    "soup":    None,   # поиск по названию
     "keto":    "Beef",
 }
 
@@ -38,71 +36,99 @@ async def _get(session: aiohttp.ClientSession, url: str) -> Optional[dict]:
             if r.status == 200:
                 return await r.json()
     except Exception as e:
-        logger.warning(f"TheMealDB error {url}: {e}")
+        logger.warning(f"API error {url}: {e}")
     return None
 
 
-async def fetch_by_ingredient(
-    session: aiohttp.ClientSession, ingredient: str
-) -> list[dict]:
-    """Получить список блюд по одному ингредиенту."""
-    url = f"{BASE}/filter.php?i={ingredient}"
-    data = await _get(session, url)
-    if data and data.get("meals"):
-        return data["meals"]  # [{idMeal, strMeal, strMealThumb}, ...]
-    return []
+async def fetch_by_ingredient(session, ingredient: str) -> list[dict]:
+    data = await _get(session, f"{BASE}/filter.php?i={ingredient}")
+    return data["meals"] if data and data.get("meals") else []
 
 
-async def fetch_by_category(
-    session: aiohttp.ClientSession, category: str
-) -> list[dict]:
-    """Получить список блюд по категории."""
-    url = f"{BASE}/filter.php?c={category}"
-    data = await _get(session, url)
-    if data and data.get("meals"):
-        return data["meals"]
-    return []
+async def fetch_by_category(session, category: str) -> list[dict]:
+    data = await _get(session, f"{BASE}/filter.php?c={category}")
+    return data["meals"] if data and data.get("meals") else []
 
 
-async def fetch_meal_detail(
-    session: aiohttp.ClientSession, meal_id: str
-) -> Optional[dict]:
-    """Получить полные данные рецепта по ID."""
-    url = f"{BASE}/lookup.php?i={meal_id}"
-    data = await _get(session, url)
+async def fetch_meal_detail(session, meal_id: str) -> Optional[dict]:
+    data = await _get(session, f"{BASE}/lookup.php?i={meal_id}")
     if data and data.get("meals"):
         return data["meals"][0]
     return None
 
 
-async def search_by_name(
-    session: aiohttp.ClientSession, query: str
-) -> list[dict]:
-    """Поиск блюд по названию (fallback)."""
-    url = f"{BASE}/search.php?s={query}"
-    data = await _get(session, url)
+async def search_by_name(session, query: str) -> list[dict]:
+    data = await _get(session, f"{BASE}/search.php?s={query}")
+    return data["meals"] if data and data.get("meals") else []
+
+
+async def fetch_random(session) -> Optional[dict]:
+    data = await _get(session, f"{BASE}/random.php")
     if data and data.get("meals"):
-        return data["meals"]
-    return []
+        return data["meals"][0]
+    return None
 
 
 def extract_ingredients_from_meal(meal: dict) -> list[str]:
-    """Извлечь список ингредиентов из полного рецепта."""
+    """Полный список ингредиентов из рецепта."""
     ingredients = []
     for i in range(1, 21):
-        name = meal.get(f"strIngredient{i}", "")
-        measure = meal.get(f"strMeasure{i}", "")
-        if name and name.strip():
-            ingredients.append(f"{measure.strip()} {name.strip()}".strip())
+        name = (meal.get(f"strIngredient{i}") or "").strip()
+        measure = (meal.get(f"strMeasure{i}") or "").strip()
+        if name:
+            ingredients.append(f"{measure} {name}".strip() if measure else name)
     return ingredients
 
 
-def format_instructions(text: str, max_chars: int = 700) -> str:
-    """Обрезать инструкции до нужной длины."""
+def calculate_match(meal: dict, user_ingredients_en: list[str]) -> dict:
+    """
+    Рассчитывает процент совпадения рецепта с имеющимися продуктами.
+
+    Returns:
+        {
+          "percent": 85.0,
+          "matched": ["eggs", "tomatoes", ...],
+          "missing": ["mozzarella"],    ← только НЕ-базовые
+          "staples": ["olive oil", "salt"],
+          "total": 10,
+        }
+    """
+    recipe_ings = extract_ingredients_from_meal(meal)
+    user_set = set(u.lower().strip() for u in user_ingredients_en)
+
+    matched, missing, staples = [], [], []
+    for ing in recipe_ings:
+        ing_lower = ing.lower()
+        # Проверяем: есть ли у пользователя
+        has_it = any(u in ing_lower or ing_lower.startswith(u) for u in user_set)
+        # Проверяем: базовый ли продукт
+        staple = is_staple(ing_lower)
+
+        if has_it:
+            matched.append(ing)
+        elif staple:
+            staples.append(ing)
+        else:
+            missing.append(ing)
+
+    # Считаем процент: (есть у юзера + базовые) / всего
+    total = len(recipe_ings)
+    covered = len(matched) + len(staples)
+    percent = (covered / total * 100) if total > 0 else 0
+
+    return {
+        "percent": round(percent, 1),
+        "matched": matched,
+        "missing": missing,
+        "staples": staples,
+        "total": total,
+    }
+
+
+def format_instructions(text: str, max_chars: int = 500) -> str:
     if not text:
         return ""
     text = text.replace("\r\n", "\n").replace("\r", "\n")
-    # Убираем лишние пустые строки
     lines = [l.strip() for l in text.split("\n") if l.strip()]
     result = ""
     for line in lines:
@@ -116,37 +142,34 @@ def format_instructions(text: str, max_chars: int = 700) -> str:
 async def find_recipes(
     ingredients_en: list[str],
     category_key: str = "any",
+    mode: str = "normal",          # "normal" | "strict"
     max_results: int = 3,
 ) -> list[dict]:
     """
-    Главная функция поиска.
-    1. По каждому ингредиенту получаем список блюд.
-    2. Считаем score (сколько ингредиентов совпало).
-    3. Берём top-N блюд.
-    4. Загружаем полные данные (фото, рецепт, ингредиенты).
+    Поиск рецептов с расчётом совпадения.
+
+    strict mode: возвращает только рецепты с match >= 80% (без учёта базовых)
+    normal mode: все рецепты, сортированные по совпадению
     """
     connector = aiohttp.TCPConnector(ssl=SSL_CTX, limit=10)
     async with aiohttp.ClientSession(connector=connector) as session:
 
-        # ── Шаг 1: собираем кандидатов ─────────────
-        meal_scores: dict[str, int] = {}    # meal_id → score
-        meal_info: dict[str, dict] = {}     # meal_id → {strMeal, strMealThumb}
-
+        # Шаг 1: кандидаты по ингредиентам
+        meal_scores: dict[str, int] = {}
+        meal_info: dict[str, dict] = {}
         category_meals: set[str] = set()
-        cat_name = CATEGORY_MAP.get(category_key)
 
-        # Для категории "суп" — ищем по ключевому слову
+        cat_name = CATEGORY_MAP.get(category_key)
         if category_key == "soup":
-            cat_results = await search_by_name(session, "soup")
-            category_meals = {m["idMeal"] for m in cat_results}
+            cat_r = await search_by_name(session, "soup")
+            category_meals = {m["idMeal"] for m in cat_r}
         elif cat_name:
-            cat_results = await fetch_by_category(session, cat_name)
-            category_meals = {m["idMeal"] for m in cat_results}
-            for m in cat_results:
+            cat_r = await fetch_by_category(session, cat_name)
+            category_meals = {m["idMeal"] for m in cat_r}
+            for m in cat_r:
                 meal_info[m["idMeal"]] = m
 
-        # Ищем по каждому ингредиенту
-        tasks = [fetch_by_ingredient(session, ing) for ing in ingredients_en[:6]]
+        tasks = [fetch_by_ingredient(session, ing) for ing in ingredients_en[:7]]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         for r in results:
@@ -156,37 +179,84 @@ async def find_recipes(
                     meal_scores[mid] = meal_scores.get(mid, 0) + 1
                     meal_info[mid] = meal
 
-        # ── Шаг 2: фильтруем и сортируем ──────────
+        # Шаг 2: сортируем кандидатов
         if category_meals:
-            # Приоритет блюдам из нужной категории
             scored = [
                 (mid, score + (10 if mid in category_meals else 0))
                 for mid, score in meal_scores.items()
             ]
         else:
             scored = list(meal_scores.items())
-
         scored.sort(key=lambda x: x[1], reverse=True)
-        top_ids = [mid for mid, _ in scored[:max_results]]
 
-        # Fallback: если ничего не нашли по ингредиентам, берём из категории
+        # Берём топ-кандидатов для загрузки полных данных
+        top_ids = [mid for mid, _ in scored[:max_results * 3]]
+
+        # Fallbacks
         if not top_ids and category_meals:
-            top_ids = list(category_meals)[:max_results]
-
-        # Fallback 2: если совсем ничего — ищем по первому ингредиенту по имени
+            top_ids = list(category_meals)[:max_results * 3]
         if not top_ids and ingredients_en:
-            fallback = await search_by_name(session, ingredients_en[0])
-            top_ids = [m["idMeal"] for m in fallback[:max_results]]
-            for m in fallback:
-                meal_info[m["idMeal"]] = m
+            fb = await search_by_name(session, ingredients_en[0])
+            top_ids = [m["idMeal"] for m in fb[:max_results * 3]]
 
-        # ── Шаг 3: загружаем полные рецепты ────────
+        # Шаг 3: загружаем полные данные
         detail_tasks = [fetch_meal_detail(session, mid) for mid in top_ids]
         details = await asyncio.gather(*detail_tasks, return_exceptions=True)
 
-        full_meals = []
-        for detail in details:
-            if isinstance(detail, dict) and detail:
-                full_meals.append(detail)
+        full_meals = [d for d in details if isinstance(d, dict) and d]
 
-    return full_meals
+    # Шаг 4: считаем match и фильтруем
+    scored_meals = []
+    for meal in full_meals:
+        match = calculate_match(meal, ingredients_en)
+        meal["_match"] = match
+        scored_meals.append((match["percent"], meal))
+
+    scored_meals.sort(key=lambda x: x[0], reverse=True)
+
+    if mode == "strict":
+        # Строгий режим: только если недостающих ≤ 2 (не считая базовых)
+        filtered = [
+            (pct, m) for pct, m in scored_meals
+            if len(m["_match"]["missing"]) <= 2 and pct >= 70
+        ]
+        if not filtered:
+            # Ослабляем: берём лучший по проценту
+            filtered = scored_meals
+    else:
+        filtered = scored_meals
+
+    return [m for _, m in filtered[:max_results]]
+
+
+async def get_random_recipe(ingredients_en: list[str]) -> Optional[dict]:
+    """Случайный рецепт из тех, что подходят по ингредиентам."""
+    import random
+    connector = aiohttp.TCPConnector(ssl=SSL_CTX, limit=5)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        tasks = [fetch_by_ingredient(session, ing) for ing in ingredients_en[:3]]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        candidates = {}
+        for r in results:
+            if isinstance(r, list):
+                for m in r:
+                    candidates[m["idMeal"]] = m
+
+        if not candidates:
+            meal = await fetch_random(session)
+            if meal:
+                meal["_match"] = calculate_match(meal, ingredients_en)
+            return meal
+
+        # Случайный из топ-10 кандидатов
+        picks = random.sample(list(candidates.keys()), min(5, len(candidates)))
+        detail_tasks = [fetch_meal_detail(session, mid) for mid in picks]
+        details = await asyncio.gather(*detail_tasks, return_exceptions=True)
+        meals = [d for d in details if isinstance(d, dict) and d]
+
+        if meals:
+            chosen = random.choice(meals)
+            chosen["_match"] = calculate_match(chosen, ingredients_en)
+            return chosen
+    return None
