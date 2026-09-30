@@ -1,5 +1,5 @@
 """
-Хендлеры холодильника: /fridge, /whatcook, /favorites, /stats, /mode.
+Хендлеры холодильника и интерактивного Избранного (GUI).
 """
 import logging
 
@@ -8,206 +8,146 @@ from telegram.ext import ContextTypes
 
 from utils.user_state import get_user_lang_code
 from utils.fridge import (
-    get_fridge, save_fridge, clear_fridge, add_to_fridge,
-    get_mode, set_mode, toggle_mode,
-    get_favorites, remove_favorite, get_stats, inc_stat,
+    get_fridge, clear_fridge, get_mode, set_mode,
+    get_favorites, remove_favorite, get_stats,
 )
-from utils.i18n import get_text
-from utils.translate_text import translate_to
+from config import TEXTS
 
 logger = logging.getLogger(__name__)
 
 
-# ── /fridge — показать/управлять холодильником ────────────────
 async def fridge_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
     lang = get_user_lang_code(uid)
+    ui_lang = "ru" if lang in ("ru", "uk") else "en"
+    t = TEXTS[ui_lang]
+    
     fridge = get_fridge(uid)
-    mode = get_mode(uid)
-
-    mode_label = await get_text("mode_strict" if mode == "strict" else "mode_normal", lang)
 
     if fridge:
         items = "\n".join(f"  • {i}" for i in fridge)
-        text = (await get_text("fridge_contents", lang)).format(
-            count=len(fridge), items=items, mode=mode_label
-        )
+        text = t["fridge_contents"].format(items=items)
+        keyboard = [[InlineKeyboardButton(t["btn_clear_fridge"], callback_data="fridge_clear")]]
+        await update.message.reply_html(text, reply_markup=InlineKeyboardMarkup(keyboard))
     else:
-        text = await get_text("fridge_empty", lang)
-
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                await get_text("btn_clear_fridge", lang),
-                callback_data="fridge_clear"
-            ),
-            InlineKeyboardButton(
-                await get_text("btn_toggle_mode", lang),
-                callback_data="fridge_toggle_mode"
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                await get_text("btn_whatcook", lang),
-                callback_data="fridge_cook"
-            ),
-        ],
-    ]
-    await update.message.reply_html(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        text = t["fridge_empty"]
+        await update.message.reply_html(text)
 
 
-# ── /whatcook — что приготовить из холодильника ───────────────
-async def whatcook_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    uid = update.effective_user.id
-    lang = get_user_lang_code(uid)
-    fridge = get_fridge(uid)
-
-    if not fridge:
-        empty_msg = await get_text("fridge_empty_cook", lang)
-        await update.message.reply_html(empty_msg)
-        return
-
-    # Запускаем поиск как будто пользователь ввёл продукты из холодильника
-    from telegram import Message
-    # Имитируем сообщение с продуктами из холодильника
-    update.message.text = ", ".join(fridge)
-    from handlers.recipe import recipe_message_handler
-    await recipe_message_handler(update, context)
-
-
-# ── /mode — переключить режим поиска ─────────────────────────
-async def mode_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    uid = update.effective_user.id
-    lang = get_user_lang_code(uid)
-    current = get_mode(uid)
-
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                ("✅ " if current == "normal" else "") + await get_text("mode_normal", lang),
-                callback_data="mode_normal"
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                ("✅ " if current == "strict" else "") + await get_text("mode_strict", lang),
-                callback_data="mode_strict"
-            ),
-        ],
-    ]
-    text = await get_text("choose_mode", lang)
-    await update.message.reply_html(text, reply_markup=InlineKeyboardMarkup(keyboard))
-
-
-# ── /favorites — избранные рецепты ────────────────────────────
 async def favorites_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Выводит интерактивный список избранного (GUI)."""
     uid = update.effective_user.id
     lang = get_user_lang_code(uid)
+    ui_lang = "ru" if lang in ("ru", "uk") else "en"
+    t = TEXTS[ui_lang]
+    
     favs = get_favorites(uid)
 
     if not favs:
-        msg = await get_text("favorites_empty", lang)
-        await update.message.reply_html(msg)
+        await update.message.reply_html(t["favorites_empty"])
         return
 
-    hdr = await get_text("favorites_header", lang)
-    lines = [hdr]
-    for i, fav in enumerate(favs, 1):
-        name = fav.get("name", "?")
-        url = fav.get("url", "")
-        if url:
-            lines.append(f"{i}. <a href='{url}'>{name}</a>")
-        else:
-            lines.append(f"{i}. {name}")
-    await update.message.reply_html("\n".join(lines), disable_web_page_preview=True)
+    # Создаем GUI меню из кнопок (до 15 штук)
+    keyboard = []
+    for fav in favs[:15]:
+        name = fav.get("name", "Recipe")
+        meal_id = fav.get("id", "")
+        if meal_id:
+            keyboard.append([InlineKeyboardButton(f"🍽 {name}", callback_data=f"fav_show_{meal_id}")])
+            
+    markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_html(t["favorites_header"], reply_markup=markup)
 
 
-# ── /stats — статистика пользователя ─────────────────────────
 async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
     lang = get_user_lang_code(uid)
+    ui_lang = "ru" if lang in ("ru", "uk") else "en"
+    t = TEXTS[ui_lang]
+    
     stats = get_stats(uid)
-    fridge = get_fridge(uid)
-    mode = get_mode(uid)
     favs = get_favorites(uid)
-    mode_label = await get_text("mode_strict" if mode == "strict" else "mode_normal", lang)
 
-    text = (await get_text("stats_text", lang)).format(
+    text = t["stats_text"].format(
         searches=stats.get("searches", 0),
-        seen=stats.get("recipes_seen", 0),
         favs=len(favs),
-        fridge_count=len(fridge),
-        mode=mode_label,
     )
     await update.message.reply_html(text)
 
 
-# ── Callback-кнопки ───────────────────────────────────────────
 async def fridge_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
     uid = query.from_user.id
     lang = get_user_lang_code(uid)
+    ui_lang = "ru" if lang in ("ru", "uk") else "en"
+    t = TEXTS[ui_lang]
     data = query.data
 
     if data == "fridge_clear":
         clear_fridge(uid)
-        msg = await get_text("fridge_cleared", lang)
-        await query.edit_message_text(msg, parse_mode="HTML")
-
-    elif data == "fridge_toggle_mode":
-        new_mode = toggle_mode(uid)
-        mode_label = await get_text("mode_strict" if new_mode == "strict" else "mode_normal", lang)
-        msg = (await get_text("mode_changed", lang)).format(mode=mode_label)
-        await query.edit_message_text(msg, parse_mode="HTML")
-
-    elif data == "fridge_cook":
-        fridge = get_fridge(uid)
-        if not fridge:
-            await query.edit_message_text(await get_text("fridge_empty_cook", lang), parse_mode="HTML")
-        else:
-            await query.edit_message_text(
-                await get_text("searching", lang).then if False else
-                (await get_text("searching", lang)).format(ingredients=", ".join(fridge[:5])),
-                parse_mode="HTML"
-            )
-            # Запускаем поиск
-            update.callback_query.message.text = ", ".join(fridge)
-            from handlers.recipe import recipe_message_handler
-            # Создаём фейковый update с текстом из холодильника
-            from telegram import Message as TGMessage
-            # Просто отправляем новое сообщение с инструкцией
-            await query.message.reply_html(
-                (await get_text("searching", lang)).format(ingredients=", ".join(fridge[:5]))
-            )
-
-    elif data in ("mode_normal", "mode_strict"):
-        new_mode = data.replace("mode_", "")
-        set_mode(uid, new_mode)
-        mode_label = await get_text("mode_strict" if new_mode == "strict" else "mode_normal", lang)
-        msg = (await get_text("mode_changed", lang)).format(mode=mode_label)
-        await query.edit_message_text(msg, parse_mode="HTML")
+        await query.edit_message_text(t["fridge_cleared"], parse_mode="HTML")
 
     elif data.startswith("fav_remove_"):
         meal_id = data.replace("fav_remove_", "")
         removed = remove_favorite(uid, meal_id)
-        if removed:
-            msg = await get_text("fav_removed", lang)
-        else:
-            msg = await get_text("fav_not_found", lang)
-        await query.answer(msg)
+        msg = t["fav_removed"] if removed else t["fav_not_found"]
+        await query.answer(msg, show_alert=False)
+        
+        # Если мы кликнули на удаление прямо из карусели рецепта,
+        # нужно обновить клавиатуру (поменять кнопку на "Сохранить")
+        from utils.user_state import user_data
+        from handlers.recipe import send_carousel_step
+        if "carousel" in user_data.get(uid, {}):
+            await send_carousel_step(query, uid, lang, t, is_edit=True)
 
     elif data.startswith("fav_add_"):
-        # Добавление в избранное из рецепта (callback из recipe.py)
         parts = data.split("|")
         meal_id = parts[0].replace("fav_add_", "")
         name = parts[1] if len(parts) > 1 else "Recipe"
         url = parts[2] if len(parts) > 2 else ""
-        from utils.fridge import add_favorite
+        from utils.fridge import add_favorite, inc_stat
+        
         added = add_favorite(uid, meal_id, name, url)
+        msg = t["fav_added"] if added else t["fav_already"]
         if added:
-            msg = await get_text("fav_added", lang)
             inc_stat(uid, "favorites_count")
-        else:
-            msg = await get_text("fav_already", lang)
-        await query.answer(msg)
+            
+        await query.answer(msg, show_alert=False)
+        
+        # Обновляем клавиатуру карусели (поменяется на "Убрать")
+        from utils.user_state import user_data
+        from handlers.recipe import send_carousel_step
+        if "carousel" in user_data.get(uid, {}):
+            await send_carousel_step(query, uid, lang, t, is_edit=True)
+
+    elif data.startswith("fav_show_"):
+        # Интерактивное открытие рецепта из избранного!
+        meal_id = data.replace("fav_show_", "")
+        
+        await query.answer(t["translating"])
+        
+        from parsers.meal_api import fetch_meal_detail, calculate_match, SSL_CTX
+        import aiohttp
+        
+        connector = aiohttp.TCPConnector(ssl=SSL_CTX, limit=5)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            meal = await fetch_meal_detail(session, meal_id)
+            
+        if not meal:
+            await query.answer(t["error"], show_alert=True)
+            return
+            
+        # Считаем совпадение с текущим холодильником
+        fridge = get_fridge(uid)
+        from handlers.recipe import translate_ingredients_full
+        ing_en = await translate_ingredients_full(fridge) if fridge else []
+        meal["_match"] = calculate_match(meal, ing_en)
+        
+        # Загружаем рецепт в "карусель" (как 1 элемент)
+        from utils.user_state import user_data
+        user_data.setdefault(uid, {})["carousel"] = {"meals": [meal], "idx": 0}
+        
+        from handlers.recipe import send_carousel_step
+        # Заменяем список избранного на карточку рецепта
+        await send_carousel_step(query, uid, lang, t, is_edit=True)

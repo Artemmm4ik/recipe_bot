@@ -49,7 +49,8 @@ def build_app(token: str) -> Application:
     app.add_handler(CallbackQueryHandler(category_callback, pattern="^cat_"))
     app.add_handler(CallbackQueryHandler(fridge_callback,   pattern="^(fridge_|mode_|fav_)"))
 
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, recipe_message_handler))
+    from handlers.router import text_router_handler
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router_handler))
 
     return app
 

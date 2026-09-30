@@ -16,7 +16,7 @@ from utils.user_state import get_user_lang_code, set_user_lang, get_user_categor
 from utils.translator import translate_ingredients
 from utils.translate_text import translate_many
 from utils.i18n import get_text
-from utils.fridge import get_mode, add_to_fridge, get_fridge, inc_stat
+from utils.fridge import get_mode, add_to_fridge, get_fridge, inc_stat, is_favorite
 from parsers.meal_api import (
     find_recipes, get_random_recipe,
     format_instructions,
@@ -51,7 +51,7 @@ async def translate_ingredients_full(raw: list[str]) -> list[str]:
 
 
 async def build_single_caption(meal: dict, lang_code: str, t: dict) -> str:
-    """Формирует красивую подпись (Title, Match, Ingredients, Instructions), строго < 1024 символов."""
+    """Формирует красивую подпись, используя БАТЧИНГ перевода (1 запрос)."""
     name_en   = meal.get("strMeal", "Recipe")
     source    = meal.get("strSource", "") or meal.get("strYoutube", "")
     instr_raw = meal.get("strInstructions", "") or ""
@@ -74,7 +74,7 @@ async def build_single_caption(meal: dict, lang_code: str, t: dict) -> str:
         lbl_cook   = t["lbl_cooking"]
         lbl_full   = t["lbl_full_recipe"]
     else:
-        # Переводим всё одним махом
+        # Переводим всё одним запросом через \n\n---XXX---\n\n
         to_tr = [name_en, instr_short, t["lbl_from_your"], t["lbl_buy_more"], t["lbl_cooking"], t["lbl_full_recipe"]] + matched + missing
         res = await translate_many(to_tr, lang_code)
         
@@ -88,7 +88,6 @@ async def build_single_caption(meal: dict, lang_code: str, t: dict) -> str:
 
     match_str = match_label(pct, t)
     
-    # Сборка
     caption = f"🍽 <b>{name_tr}</b>\n{match_str}\n\n"
     
     if matched_tr:
@@ -99,7 +98,7 @@ async def build_single_caption(meal: dict, lang_code: str, t: dict) -> str:
     if instr_tr:
         caption += f"\n👨‍🍳 <b>{lbl_cook}:</b>\n{instr_tr}"
 
-    # Оставляем место для ссылки (50 символов)
+    # Ограничение Telegram 1024
     if len(caption) > 950:
         caption = caption[:950] + "..."
         
@@ -109,14 +108,19 @@ async def build_single_caption(meal: dict, lang_code: str, t: dict) -> str:
     return caption
 
 
-def make_carousel_keyboard(meal: dict, current_idx: int, total: int, t: dict) -> InlineKeyboardMarkup:
-    """Кнопки под рецептом: ❤️ и ⏭"""
+def make_carousel_keyboard(meal: dict, current_idx: int, total: int, t: dict, user_id: int) -> InlineKeyboardMarkup:
+    """Кнопки под рецептом с учетом статуса 'В избранном' (GUI)"""
     meal_id = meal.get("idMeal", "")
     name    = meal.get("strMeal", "")[:30]
     
-    row = [
-        InlineKeyboardButton("❤️", callback_data=f"fav_add_{meal_id}|{name}"),
-    ]
+    if is_favorite(user_id, meal_id):
+        # Если в избранном -> кнопка 💔 Убрать
+        row = [InlineKeyboardButton(f"💔 {t['btn_unfavorite']}", callback_data=f"fav_remove_{meal_id}")]
+    else:
+        # Если нет -> кнопка ❤️ Сохранить
+        row = [InlineKeyboardButton(f"❤️ {t['btn_favorite']}", callback_data=f"fav_add_{meal_id}|{name}")]
+        
+    # Кнопка Следующий (если есть)
     if total > 1 and current_idx < total - 1:
         row.append(InlineKeyboardButton(t["btn_next"], callback_data="carousel_next"))
         
@@ -141,7 +145,7 @@ async def send_carousel_step(update_or_query, user_id: int, lang_code: str, t: d
     photo_url = meal.get("strMealThumb", "")
     
     caption  = await build_single_caption(meal, lang_code, t)
-    keyboard = make_carousel_keyboard(meal, idx, len(meals), t)
+    keyboard = make_carousel_keyboard(meal, idx, len(meals), t, user_id)
     
     try:
         if is_edit:
@@ -161,7 +165,6 @@ async def send_carousel_step(update_or_query, user_id: int, lang_code: str, t: d
                 await message.reply_html(caption, reply_markup=keyboard)
     except TelegramError as e:
         logger.error(f"Carousel send error: {e}")
-        # Фолбэк на текст
         try:
             if is_edit:
                 await update_or_query.edit_message_text(caption, parse_mode="HTML", reply_markup=keyboard)
@@ -175,14 +178,12 @@ async def carousel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     """Обработчик кнопки ⏭ Другой рецепт."""
     query = update.callback_query
     user_id = query.from_user.id
-    
     lang_code = get_user_lang_code(user_id)
     ui_lang   = "ru" if lang_code in ("ru", "uk") else "en"
     t         = TEXTS[ui_lang]
     
     await query.answer(t["translating"])
     
-    # Сдвигаем индекс
     state = user_data.setdefault(user_id, {})
     if "carousel" in state:
         state["carousel"]["idx"] += 1
@@ -190,64 +191,6 @@ async def carousel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await send_carousel_step(query, user_id, lang_code, t, is_edit=True)
 
 
-async def recipe_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user    = update.effective_user
-    user_id = user.id
-    text    = update.message.text or ""
-
-    if user_id not in user_data or "lang_code" not in user_data.get(user_id, {}):
-        set_user_lang(user_id, (user.language_code or "ru").strip())
-    lang_code = get_user_lang_code(user_id)
-    ui_lang   = "ru" if lang_code in ("ru", "uk") else "en"
-    t         = TEXTS[ui_lang]
-
-    ingredients_raw = parse_ingredients(text)
-    if not ingredients_raw:
-        await update.message.reply_html(t["too_short"])
-        return
-
-    add_to_fridge(user_id, ingredients_raw)
-    ingredients_en = await translate_ingredients_full(ingredients_raw)
-
-    cat_key = get_user_category(user_id)
-    mode    = get_mode(user_id)
-
-    await update.message.chat.send_action(ChatAction.TYPING)
-    status_msg = await update.message.reply_html(t["searching"].format(ingredients=", ".join(ingredients_raw[:5])))
-
-    try:
-        meals = await find_recipes(ingredients_en, category_key=cat_key, mode=mode, max_results=12)
-    except Exception as e:
-        logger.error(f"API Error: {e}")
-        await status_msg.edit_text(t["error"], parse_mode="HTML")
-        return
-
-    inc_stat(user_id, "searches")
-
-    if not meals:
-        await status_msg.edit_text(t["no_results"], parse_mode="HTML")
-        return
-
-    try:
-        await status_msg.delete()
-    except TelegramError:
-        pass
-
-    if mode == "strict" and meals[0].get("_match", {}).get("percent", 0) < 80:
-        await update.message.reply_html(t["strict_warn"])
-
-    # Сохраняем состояние карусели
-    user_data.setdefault(user_id, {})["carousel"] = {
-        "meals": meals,
-        "idx": 0
-    }
-    
-    # Отправляем ПЕРВЫЙ рецепт
-    await update.message.chat.send_action(ChatAction.UPLOAD_PHOTO)
-    await send_carousel_step(update, user_id, lang_code, t, is_edit=False)
-
-
-# ── /random ───────────────────────────────────────────────────
 async def random_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id   = update.effective_user.id
     lang_code = get_user_lang_code(user_id)
